@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<#-- jvm-heap-analyzer HTML 报告模板（FreeMarker）。
+     数据模型已在 Java 侧完成转义与格式化，这里只做排版。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JVM 堆转储分析报告 · ${ov.input}</title>
+<style>${css}</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>JVM 堆转储分析报告</h1>
+<div class="sub">jvm-heap-analyzer v${ov.version} · 生成时间 ${ov.generatedAt}</div>
+
+<#-- ============ ① 堆概览 ============ -->
+<h2>① 堆概览</h2>
+<div class="cards">
+  <div class="card">总堆占用<b>${ov.usedHeap}</b></div>
+  <div class="card">对象数量<b>${ov.objects}</b><small>可达 ${ov.reachable}</small></div>
+  <div class="card">类数量<b>${ov.classes}</b></div>
+  <div class="card">GC Root 数量<b>${ov.gcRoots}</b></div>
+  <div class="card">Retained 计算<b style="font-size:14px">${ov.domMode}</b></div>
+</div>
+<p class="sub">输入文件：<code>${ov.input}</code><br>
+JVM 信息：${ov.jvm}<br>
+Dump 时间：${ov.dumpTime}<br>
+运行参数：${ov.options}</p>
+
+<#-- ============ ② Top 内存占用类 ============ -->
+<h2>② Top 内存占用类（按 Retained Heap）</h2>
+<#if topClasses?size == 0>
+  <div class="empty">未发现类级内存占用数据</div>
+<#else>
+<table>
+<tr><th>#</th><th>类名</th><th class="num">实例数</th>
+<th class="num">Used Heap（Σ Shallow）</th><th class="num">Retained Heap（支配树聚合）</th></tr>
+<#list topClasses as r>
+<tr><td>${r.rank}</td><td><code>${r.name}</code></td>
+<td class="num">${r.objects}</td><td class="num">${r.shallow}</td>
+<td class="num">${r.retained}</td></tr>
+</#list>
+</table>
+</#if>
+
+<#-- ============ ③ 内存泄漏嫌疑 ============ -->
+<h2>③ 内存泄漏嫌疑</h2>
+<#if suspects?size == 0>
+  <div class="empty">没有超过 Retained 阈值的顶层组件，未发现明显泄漏嫌疑 🎉</div>
+<#else>
+  <#list suspects as s>
+  <div class="card" style="margin-bottom:14px;flex:none">
+    <div><span class="tag">#${s.rank} · score ${s.score}</span>
+         <span class="tag p">${s.pattern}</span>
+         <b style="font-size:15px;color:var(--txt)">${s.display}</b></div>
+    <div class="sub" style="margin-top:6px">类：<code>${s.clazz}</code>
+         · Shallow ${s.shallow} · <strong style="color:var(--bad)">Retained ${s.retained}</strong></div>
+    <#if s.details?size &gt; 0><ul class="det"><#list s.details as d><li>${d}</li></#list></ul></#if>
+    <details open><summary>GC Root 最短引用链</summary>${s.pathHtml}</details>
+    <strong style="color:var(--ok)">修复建议</strong>
+    <ul class="rec"><#list s.recs as r><li>${r}</li></#list></ul>
+  </div>
+  </#list>
+</#if>
+
+<#-- ============ 通用发现表格宏 ============ -->
+<#macro findingTable title rows emptyText>
+<h2>${title}</h2>
+<#if rows?size == 0>
+  <div class="empty">${emptyText}</div>
+<#else>
+<table>
+<tr><th>对象</th><th>类</th><th class="num">Shallow</th><th class="num">Retained</th>
+<th class="num">score</th><th>模式</th><th>备注</th></tr>
+<#list rows as r>
+<tr>
+  <td><code>${r.display}</code></td>
+  <td>${r.clazz}</td>
+  <td class="num">${r.shallow}</td>
+  <td class="num">${r.retained}</td>
+  <td class="num">${r.score}</td>
+  <td>${r.pattern}</td>
+  <td>
+    <#if r.details?size &gt; 0><ul class="det"><#list r.details as d><li>${d}</li></#list></ul></#if>
+    <#if r.pathHtml?has_content><details><summary>引用链</summary>${r.pathHtml}</details></#if>
+  </td>
+</tr>
+</#list>
+</table>
+</#if>
+</#macro>
+
+<#-- ============ ④~⑦ ============ -->
+<@findingTable "④ 大对象列表" largeObjects "未超过浅堆阈值的大对象（默认门槛 ≥1MB）" />
+<@findingTable "⑤ 可疑集合（Retained 超阈值的 Map / List / Set）" collections "未发现异常增长的集合" />
+<@findingTable "⑥ ThreadLocal 持有分析" threadLocals "未发现线程大量持有 ThreadLocal 数据" />
+<@findingTable "⑦ ClassLoader 异常" classLoaders "未发现同型 ClassLoader 多实例异常" />
+
+<div class="foot">
+  本报告由 jvm-heap-analyzer 离线生成（解析引擎 Eclipse MAT）。
+  Retained 口径：对象自身及“仅因它而存活”的对象之和；按类 Retained 为支配树聚合，
+  同型嵌套实例间存在正常归账转移。引用链使用 BFS 最短路径，
+  <code>→ field →</code> 表示上一跳经由该字段/下标引用。
+</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,181 @@
+// =====================================================================
+// jvm-heap-analyzer 构建脚本
+// 说明：
+//  - Eclipse MAT（org.eclipse.mat.*）官方未在 Maven Central 发布构件，
+//    因此将从 Eclipse 官方更新站点下载的 MAT 1.15 jar（Java-8 字节码，
+//    兼容本机 JDK 17）放在 libs/mat 目录，经 matRuntime 配置引入。
+//  - MAT 在“纯 Java（非 OSGi）”环境下运行需要 Equinox 平台运行时，
+//    这些在 Maven Central 上有正式构件（groupId = org.eclipse.platform）。
+//  - 各 bundle jar 根目录的 plugin.xml 在 fat-jar 合并时会路径冲突：
+//    patchMatLibs 任务把每个 jar 里的 plugin.xml 改名为
+//    eclipse-plugin/<bundle符号名>.xml（天然唯一）并去掉签名文件；
+//    程序端（MatRuntimeBootstrap）按同一约定加载。
+//  - 构建产物为可执行 fat-jar：build/libs/jvm-heap-analyzer-<版本>.jar
+// =====================================================================
+plugins {
+    id 'java'
+    id 'application'
+    // shadow：将所有依赖打进单个 jar，满足 java -jar 直接运行的交付要求
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+group = 'com.analyzer'
+version = '1.0.0'
+
+java {
+    // 使用本机已有的 JDK 17，不自动下载其他版本
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+configurations {
+    // MAT 及其 Equinox 运行时 jar 的原始来源（不直接进编译类路径）
+    matRuntime
+    // 预处理产物（build/prep-libs 里的 jar）经由该配置汇入 implementation
+    fatMerge
+}
+
+// ---------------------------------------------------------------------
+// plugin.xml 预处理任务：把 matRuntime 的每个 jar 复制进 build/prep-libs，
+// 将根目录 plugin.xml 改名为 eclipse-plugin/<bundle>.xml，
+// 并剔除 equinox 签名文件（合并后必然失效，反而干扰类加载器校验）。
+// ---------------------------------------------------------------------
+def prepDir = layout.buildDirectory.dir('prep-libs')
+
+tasks.register('patchMatLibs') {
+    description = 'Rewrite MAT/Equinox jars: unique-ify plugin.xml entries & drop signatures'
+    inputs.files configurations.matRuntime
+    outputs.dir prepDir
+    doLast {
+        def out = prepDir.get().asFile
+        // 仅清理本任务自产的中间目录（始终位于 build/ 之下）
+        out.listFiles()?.each { it.delete() }
+        out.mkdirs()
+        configurations.matRuntime.files.each { jar ->
+            def bundle = jar.name.replaceFirst(/\.jar$/, '')
+            int cutU = bundle.lastIndexOf((int) ((char) '_'))
+            int cutD = bundle.lastIndexOf((int) ((char) '-'))
+            int cut = Math.max(cutU, cutD)
+            if (cut > 0) bundle = bundle.substring(0, cut)
+
+            def zis = new java.util.zip.ZipFile(jar)
+            def target = new File(out, jar.name)
+            def zos = new java.util.zip.ZipOutputStream(
+                    new java.io.BufferedOutputStream(new FileOutputStream(target)))
+            boolean rewritten = false
+            zis.entries().each { e ->
+                String name = e.name
+                if (name ==~ /META-INF\/(ECLIPSE_|.*\.(SF|RSA|DSA)).*/) return // 去签名
+                java.util.zip.ZipEntry ne = new java.util.zip.ZipEntry(name)
+                if (name == 'plugin.xml') {
+                    // 改名：fat-jar 合并后不再互相覆盖
+                    ne = new java.util.zip.ZipEntry("eclipse-plugin/${bundle}.xml")
+                    rewritten = true
+                }
+                zos.putNextEntry(ne)
+                if (!e.isDirectory()) {
+                    def ins = zis.getInputStream(e)
+                    try {
+                        byte[] buf = new byte[8192]
+                        int n
+                        while ((n = ins.read(buf)) > 0) {
+                            zos.write(buf, 0, n)
+                        }
+                    } finally {
+                        ins.close()
+                    }
+                }
+                zos.closeEntry()
+            }
+            zos.close()
+            zis.close()
+            if (rewritten) logger.info("patched plugin.xml -> eclipse-plugin/${bundle}.xml")
+        }
+    }
+}
+
+// 预处理后的 jar 集合（带任务依赖：消费方先触发 patchMatLibs 执行）
+def patchedJars = files(fileTree(prepDir) { include '*.jar' })
+        .builtBy(tasks.named('patchMatLibs'))
+
+dependencies {
+    // ---- Eclipse MAT 解析引擎（本地 jar，见 libs/mat）----
+    matRuntime fileTree(dir: 'libs/mat', include: ['*.jar'])
+
+    // ---- MAT 脱离 OSGi 运行所需的 Eclipse 平台运行时（Equinox plain 模式）----
+    matRuntime 'org.eclipse.platform:org.eclipse.core.runtime:[3.26,4.0)'
+    matRuntime 'org.eclipse.platform:org.eclipse.equinox.common:[3.18,4.0)'
+    matRuntime 'org.eclipse.platform:org.eclipse.equinox.registry:[3.11,4.0)'
+    matRuntime 'org.eclipse.platform:org.eclipse.equinox.preferences:[3.10,4.0)'
+    matRuntime 'org.eclipse.platform:org.eclipse.core.contenttype:[3.9,4.0)'
+    matRuntime 'org.eclipse.platform:org.eclipse.core.jobs:[3.15,4.0)'
+    matRuntime 'org.eclipse.platform:org.eclipse.osgi:[3.18,4.0)'
+    // ---- MAT 内部消息格式化依赖 ICU4J ----
+    matRuntime 'com.ibm.icu:icu4j:74.2'
+
+    // ---- 预处理后的 MAT/Equinox jar（唯一化的 eclipse-plugin 资源）----
+    fatMerge patchedJars
+
+    // ---- 命令行解析 ----
+    implementation 'info.picocli:picocli:4.7.5'
+    // ---- HTML 报告模板引擎 ----
+    implementation 'org.freemarker:freemarker:2.3.34'
+    // ---- summary.json 序列化 ----
+    implementation 'com.google.code.gson:gson:2.11.0'
+
+    // ---- 单元测试 ----
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// matRuntime 原始 jar 不直接进类路径；只有预处理产物参与编译/运行/fat-jar 合并
+configurations.implementation.extendsFrom configurations.fatMerge
+
+application {
+    mainClass = 'com.analyzer.cli.AnalyzerMain'
+}
+
+compileJava.options.encoding = 'UTF-8'
+compileTestJava.options.encoding = 'UTF-8'
+
+test {
+    useJUnitPlatform()
+    maxHeapSize = '2g'
+    testLogging { events 'passed', 'failed', 'skipped' }
+}
+
+shadowJar {
+    archiveBaseName = 'jvm-heap-analyzer'
+    archiveClassifier = ''
+    zip64 = true
+    mergeServiceFiles()
+    // 双保险：排除任何漏网的 equinox 签名文件
+    exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA', 'META-INF/ECLIPSE_*'
+    manifest {
+        attributes(
+            'Main-Class': 'com.analyzer.cli.AnalyzerMain',
+            'Multi-Release': 'true'
+        )
+    }
+}
+
+// application 插件的发行任务与 fat-jar 输出目录重叠且无依赖声明，
+// 本项目交付形态就是单个可执行 jar，直接禁用这些分发任务。
+['distZip', 'distTar', 'startScripts', 'startShadowScripts', 'installDist',
+ 'installShadowDist', 'shadowDistTar', 'shadowDistZip'].each { t ->
+    tasks.named(t) { enabled = false }
+}
+
+build.dependsOn shadowJar
+
+// 诊断任务：打印真实编译类路径
+tasks.register('printCp') {
+    doLast {
+        sourceSets.main.compileClasspath.files.each { println it }
+    }
+}

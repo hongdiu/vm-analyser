@@ -1,0 +1,30 @@
+# Gradle
+.gradle/
+build/
+# Eclipse MAT 解析时生成的索引缓存（放在 hprof 旁边）
+*.index
+*.o2c.index
+*.hprof.index
+*.outbound.index
+*.domIn.out
+*.domOut
+*.threads
+# 冒烟测试产物
+build-logs/
+# IDE
+.idea/
+*.iml
+.vscode/
+# 报告输出
+report/
+out/
+src/test/resources/sample-leak.*
+
+# 后台模式日志
+analyze.log
+*.run.log
+
+# 分析报告产物（勿入库）
+/index.html
+/summary.json
+/assets/

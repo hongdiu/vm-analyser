@@ -1,0 +1,2 @@
+// 项目设置：根工程名即交付物 jar 名（jvm-heap-analyzer.jar）
+rootProject.name = 'jvm-heap-analyzer'
