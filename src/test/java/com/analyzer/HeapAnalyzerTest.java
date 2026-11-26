@@ -173,11 +173,46 @@ class HeapAnalyzerTest {
         assertTrue(html.contains("内存泄漏嫌疑"));
         assertTrue(html.contains("① 堆概览"));
         assertTrue(html.contains("GC Root 最短引用链"));
+        // 首屏固定格式结论 + 可展开原始堆栈 + 代码位置
+        assertTrue(html.contains("◎ 诊断结论"));
+        assertTrue(html.contains("代码线索"));
+        assertTrue(html.contains("原始堆栈"));
+        assertTrue(html.contains("GLOBAL_CACHE"), "static field clue should be rendered");
+        assertTrue(html.contains("LeakDemo.java:111"), "thread stack clue should point to app code");
+        // 同一代码位置只应出现一张结论卡，其余对象并入证据
+        assertTrue(html.contains("同一代码位置的其他对象"),
+                "findings sharing one code location must be merged into one conclusion");
         assertTrue(Files.size(out.resolve("assets/style.css")) > 100);
         String json = Files.readString(out.resolve("summary.json"));
         assertTrue(json.contains("\"leakSuspects\""));
+        assertTrue(json.contains("\"conclusions\""));
+        assertTrue(json.contains("\"codeLocations\""));
+        assertTrue(json.contains("LeakDemo.java:111"));
         assertTrue(json.contains("\"dominatorMode\": \"own\""));
         // 清理本用例生成的索引（保留 hprof 供其他用例复用）
+        try (var s = Files.walk(out)) {
+            s.sorted((a, b) -> b.getNameCount() - a.getNameCount()).forEach(p -> p.toFile().delete());
+        }
+    }
+
+    @Test
+    @DisplayName("基线对比：同一 dump 作为基线时报告含⑧，且不产生虚假增长")
+    void cliBaselineCompare() throws Exception {
+        Path out = Files.createTempDirectory("jvm-ha-baseline");
+        int code = new CommandLine(new AnalyzerMain()).execute(
+                "-i", sampleHprof.toString(),
+                "-o", out.toString(),
+                "--top", "5",
+                "--min-retained-mb", "2",
+                "--baseline", sampleHprof.toString());
+        assertEquals(0, code);
+        String html = Files.readString(out.resolve("index.html"));
+        assertTrue(html.contains("⑧ 基线对比"));
+        String json = Files.readString(out.resolve("summary.json"));
+        assertTrue(json.contains("\"growth\""));
+        assertTrue(json.contains("\"baseline\""));
+        assertTrue(json.contains("\"growingClasses\": []"),
+                "comparing a dump with itself must not report growth");
         try (var s = Files.walk(out)) {
             s.sorted((a, b) -> b.getNameCount() - a.getNameCount()).forEach(p -> p.toFile().delete());
         }

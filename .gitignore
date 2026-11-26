@@ -15,10 +15,13 @@ build-logs/
 .idea/
 *.iml
 .vscode/
-# 报告输出
-report/
-out/
+# 报告输出（只忽略仓库根目录的报告目录，避免误伤 com/analyzer/report 源码包）
+/report/
+/out/
 src/test/resources/sample-leak.*
+
+# 分发包产物
+/dist/
 
 # 后台模式日志
 analyze.log

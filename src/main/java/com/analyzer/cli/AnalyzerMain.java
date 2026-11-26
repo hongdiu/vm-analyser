@@ -1,12 +1,17 @@
 package com.analyzer.cli;
 
+import com.analyzer.analysis.AccumulationAnalyzer;
 import com.analyzer.analysis.ClassLoaderLeakDetector;
+import com.analyzer.analysis.CodeLocation;
+import com.analyzer.analysis.CodeLocationExtractor;
 import com.analyzer.analysis.CollectionGrowthDetector;
 import com.analyzer.analysis.Detector;
 import com.analyzer.analysis.DetectorContext;
 import com.analyzer.analysis.DominatorCalculator;
 import com.analyzer.analysis.DominatorResult;
 import com.analyzer.analysis.Finding;
+import com.analyzer.analysis.GrowthAnalyzer;
+import com.analyzer.analysis.GrowthReport;
 import com.analyzer.analysis.LargeObjectDetector;
 import com.analyzer.analysis.LeakPatternMatcher;
 import com.analyzer.analysis.LeakSuspectDetector;
@@ -14,12 +19,14 @@ import com.analyzer.analysis.ThreadLocalLeakDetector;
 import com.analyzer.graph.ClassInfo;
 import com.analyzer.graph.GcRootPathAnalyzer;
 import com.analyzer.graph.HeapGraph;
+import com.analyzer.graph.ThreadStackIndex;
 import com.analyzer.parser.ConsoleProgressListener;
 import com.analyzer.parser.HprofParserAdapter;
 import com.analyzer.report.HtmlReporter;
 import com.analyzer.report.JsonReporter;
 import com.analyzer.report.ReportData;
 import com.analyzer.util.Fmt;
+import org.eclipse.mat.snapshot.ISnapshot;
 import org.eclipse.mat.snapshot.SnapshotInfo;
 import org.eclipse.mat.snapshot.model.IClass;
 import picocli.CommandLine;
@@ -27,14 +34,18 @@ import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
 import java.io.File;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 
 /**
@@ -76,6 +87,16 @@ public final class AnalyzerMain implements Callable<Integer> {
 
     @Option(names = "--verbose", description = "verbose MAT parse progress")
     private boolean verbose;
+
+    @Option(names = "--app-prefix", defaultValue = "",
+            description = "comma-separated business class prefixes; used to pick app frames "
+                    + "from thread stacks (default: ${DEFAULT-VALUE})")
+    private String appPrefix;
+
+    @Option(names = "--baseline",
+            description = "optional earlier hprof; compares per-class instance/shallow growth "
+                    + "(the only hard evidence of a leak)")
+    private String baselinePath;
 
     @Override
     public Integer call() {
@@ -137,16 +158,19 @@ public final class AnalyzerMain implements Callable<Integer> {
                 phase.set("running detectors");
                 System.out.println("[3/4] running detectors...");
                 GcRootPathAnalyzer pathAnalyzer = new GcRootPathAnalyzer(graph);
+                data.overview = buildOverview(graph, domResult, data);
+
                 long minRetainedBytes = (long) (minRetainedMb * Fmt.MB);
                 DetectorContext ctx = new DetectorContext(graph, domResult, pathAnalyzer,
                         new LeakPatternMatcher(), top, maxPath, minRetainedBytes);
-
-                data.overview = buildOverview(graph, domResult, data);
-                data.topClasses = buildTopClasses(graph, domResult, top);
+                // 大堆降级时，用有界支配下钻找出真正的累积点（替代“线程/ClassLoader 本身”）
+                ThreadStackIndex stackIndex = new ThreadStackIndex(adapter.snapshot());
+                AccumulationAnalyzer accumulation = new AccumulationAnalyzer(
+                        graph, domResult, stackIndex, minRetainedBytes, top, verbose);
 
                 // 统一接口调度各检测器；单个检测器异常不阻断整体报告
                 List<Detector> detectors = List.of(
-                        new LeakSuspectDetector(),
+                        new LeakSuspectDetector(accumulation),
                         new LargeObjectDetector(),
                         new CollectionGrowthDetector(),
                         new ThreadLocalLeakDetector(),
@@ -177,6 +201,37 @@ public final class AnalyzerMain implements Callable<Integer> {
                 data.collections = bySection.getOrDefault("可疑集合", List.of());
                 data.threadLocals = bySection.getOrDefault("ThreadLocal 持有分析", List.of());
                 data.classLoaders = bySection.getOrDefault("ClassLoader 异常", List.of());
+
+                // 证据补全：把引用链上的 Java Local / 线程栈 / 静态字段翻译成“代码位置”，
+                // 并保留原始栈帧供报告展开核对。必须在快照关闭前完成。
+                CodeLocationExtractor locationExtractor = new CodeLocationExtractor(
+                        graph, stackIndex, domResult, data.overview.usedHeapBytes,
+                        CodeLocationExtractor.parsePrefixes(appPrefix));
+                for (List<Finding> list : bySection.values()) {
+                    for (Finding f : list) {
+                        locationExtractor.apply(f);
+                    }
+                }
+                long withCodeLine = bySection.values().stream()
+                        .flatMap(List::stream)
+                        .filter(f -> {
+                            com.analyzer.analysis.CodeLocation loc = f.primaryCodeLocation();
+                            return loc != null && loc.hasSourceLine();
+                        })
+                        .count();
+                System.out.println("      - evidence: " + withCodeLine
+                        + " findings with source-code location");
+
+                // 首屏结论去重：累积点会给出“线程根 → 累积点 → 其大子对象”同一链上的多个对象，
+                // 它们共用同一个业务帧，直接取前 3 条会让报告看起来是重复结论。
+                data.conclusions = distinctConclusions(data.leakSuspects, 3);
+
+                // Top 类榜单放在检测之后：降级模式没有类 retained，
+                // 需要借用累积点下钻得到的近似类统计，避免报告②整块为空。
+                data.topClasses = buildTopClasses(graph, domResult, top, accumulation);
+
+                // 基线对比：提供第二份更早的 dump 时，给出“哪些类在涨”的硬证据
+                compareBaseline(adapter.snapshot(), data, bySection);
             }
 
             phase.set("writing report");
@@ -209,6 +264,131 @@ public final class AnalyzerMain implements Callable<Integer> {
 
     // ------------------------------------------------------------------
 
+    /**
+     * 首屏结论去重：同一代码位置只保留排名最高的一条，其余并入证据。
+     *
+     * <p>原因：累积点分析对同一个线程会给出“线程根 → 下钻累积点 → 其大子对象”
+     * 一链上的多个对象（如 Thread、StatefulPersistenceContext、Object[]），
+     * 它们共用同一个线程栈业务帧。若直接取前 3 条，首屏就会出现三张
+     * “代码线索完全相同”的卡片。这里按 {@code 位置类型 + display()}
+     * 归并（跨线程同样归并，合并说明里保留线程名），腾出的名额留给
+     * 后面真正不同位置的结论。</p>
+     */
+    static List<Finding> distinctConclusions(List<Finding> suspects, int limit) {
+        List<Finding> out = new ArrayList<>();
+        if (suspects == null) {
+            return out;
+        }
+        Map<String, Finding> byLocation = new HashMap<>();
+        for (Finding f : suspects) {
+            if (out.size() >= limit) {
+                break;
+            }
+            String key = codeLocationKey(f);
+            if (key == null) {
+                out.add(f);
+                continue;
+            }
+            Finding kept = byLocation.get(key);
+            if (kept == null) {
+                byLocation.put(key, f);
+                out.add(f);
+            } else {
+                kept.details.merge("同一代码位置的其他对象", describeSameLocation(f),
+                        (a, b) -> a + "；" + b);
+                // 保留更具体的模式与建议（如线程根未归类、其累积点命中“结果集全量累积”），
+                // 否则合并后会丢掉最有行动价值的那条诊断。
+                if (LeakPatternMatcher.NONE.equals(kept.pattern)
+                        && !LeakPatternMatcher.NONE.equals(f.pattern)) {
+                    kept.pattern = f.pattern;
+                    kept.patternLabel = f.patternLabel;
+                    for (String rec : f.recommendations) {
+                        if (!kept.recommendations.contains(rec)) {
+                            kept.recommendations.add(rec);
+                        }
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    /** 去重键：位置类型 + 代码位置；无法定位到代码位置的结论不参与归并。 */
+    private static String codeLocationKey(Finding f) {
+        CodeLocation loc = f.primaryCodeLocation();
+        if (loc == null || loc.className == null || loc.className.isEmpty()) {
+            return null;
+        }
+        return loc.kind + "|" + loc.display();
+    }
+
+    /** 被归并对象的简述，写进保留结论的证据里，避免信息丢失。 */
+    private static String describeSameLocation(Finding f) {
+        StringBuilder sb = new StringBuilder(f.className);
+        if (f.threadName != null) {
+            sb.append("（线程 ").append(f.threadName).append("）");
+        }
+        sb.append("，Retained ").append(Fmt.mb(f.retainedBytes));
+        if (f.patternLabel != null && !"未归类".equals(f.patternLabel)) {
+            sb.append("，模式：").append(f.patternLabel);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 基线对比：打开更早的 dump，按类给出实例数/浅堆增量，并把增量证据
+     * 挂到对应结论的 details 上。失败只告警，不影响主报告。
+     */
+    private void compareBaseline(ISnapshot current, ReportData data,
+                                 Map<String, List<Finding>> bySection) {
+        if (baselinePath == null || baselinePath.isBlank()) {
+            return;
+        }
+        Path bp = Path.of(baselinePath).toAbsolutePath();
+        if (!Files.exists(bp)) {
+            System.err.println("[warn] baseline hprof not found: " + bp);
+            return;
+        }
+        System.out.println("[growth] comparing against baseline " + bp + " ...");
+        boolean sameFile = bp.equals(input.toPath().toAbsolutePath());
+        HprofParserAdapter baselineAdapter = null;
+        try {
+            ISnapshot baselineSnapshot = current;
+            if (!sameFile) {
+                baselineAdapter = HprofParserAdapter.open(
+                        bp.toFile(), new ConsoleProgressListener(verbose));
+                baselineSnapshot = baselineAdapter.snapshot();
+            }
+            GrowthReport report = GrowthAnalyzer.compare(baselineSnapshot, current, 20);
+            report.baselinePath = bp.toString();
+            data.growth = report;
+            System.out.println("      - baseline: " + report.rows.size() + " growing classes");
+
+            Map<String, GrowthReport.Row> byName = new HashMap<>();
+            for (GrowthReport.Row row : report.rows) {
+                byName.put(row.className, row);
+            }
+            Set<Finding> seen = new HashSet<>();
+            for (List<Finding> list : bySection.values()) {
+                for (Finding f : list) {
+                    if (!seen.add(f)) {
+                        continue;
+                    }
+                    GrowthReport.Row row = byName.get(f.className);
+                    if (row != null) {
+                        f.details.put("基线对比", row.describe());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[warn] baseline compare failed: " + e.getMessage());
+        } finally {
+            if (baselineAdapter != null) {
+                baselineAdapter.close();
+            }
+        }
+    }
+
     private ReportData.Overview buildOverview(HeapGraph graph, DominatorResult dom,
                                                ReportData data) throws Exception {
         SnapshotInfo info = graph.info();
@@ -229,12 +409,18 @@ public final class AnalyzerMain implements Callable<Integer> {
         o.options.put("--top", String.valueOf(top));
         o.options.put("--max-path", String.valueOf(maxPath));
         o.options.put("--min-retained-mb", String.valueOf(minRetainedMb));
+        o.options.put("--app-prefix", appPrefix == null || appPrefix.isBlank() ? "(未指定)" : appPrefix);
+        o.options.put("--baseline", baselinePath == null || baselinePath.isBlank() ? "(未提供)" : baselinePath);
         return o;
     }
 
-    /** Top 内存占用类：按支配树聚合的类 Retained 降序。 */
-    private List<ClassInfo> buildTopClasses(HeapGraph graph, DominatorResult dom, int limit) {
+    /** Top 内存占用类：按支配树聚合的类 Retained 降序；降级模式用累积点统计近似。 */
+    private List<ClassInfo> buildTopClasses(HeapGraph graph, DominatorResult dom, int limit,
+                                            AccumulationAnalyzer accumulation) {
         Map<Integer, Long> retained = dom.classRetained();
+        if (retained.isEmpty()) {
+            return buildTopClassesFallback(graph, accumulation, limit);
+        }
         List<ClassInfo> list = new ArrayList<>();
         for (Map.Entry<Integer, Long> e : retained.entrySet()) {
             int classId = e.getKey();
@@ -256,6 +442,38 @@ public final class AnalyzerMain implements Callable<Integer> {
         list.sort(Comparator.comparingLong((ClassInfo c) -> c.retainedBytes).reversed());
         return list.size() > limit ? new ArrayList<>(list.subList(0, limit)) : list;
     }
+
+    /**
+     * 降级模式的 Top 类：retained 来自“热点根下直接子树”的近似归账，
+     * 实例数/Shallow 用 MAT 类元数据补齐，保证表格有内容且口径可解释。
+     */
+    private List<ClassInfo> buildTopClassesFallback(HeapGraph graph,
+                                                    AccumulationAnalyzer accumulation,
+                                                    int limit) {
+        List<ClassInfo> list = new ArrayList<>();
+        if (accumulation == null) {
+            return list;
+        }
+        for (Map.Entry<String, long[]> e : accumulation.fallbackClassStats().entrySet()) {
+            ClassInfo ci = new ClassInfo(-1, e.getKey());
+            ci.retainedBytes = e.getValue()[0];
+            ci.numberOfObjects = (int) Math.min(Integer.MAX_VALUE, e.getValue()[1]);
+            try {
+                var classes = graph.raw().getClassesByName(e.getKey(), false);
+                if (classes != null && !classes.isEmpty()) {
+                    IClass c = classes.iterator().next();
+                    ci.numberOfObjects = c.getNumberOfObjects();
+                    ci.shallowBytes = c.getNumberOfObjects() * c.getHeapSizePerInstance();
+                }
+            } catch (Exception ignore) {
+                // 类名取不到元数据时保留子树计数
+            }
+            list.add(ci);
+        }
+        list.sort(Comparator.comparingLong((ClassInfo c) -> c.retainedBytes).reversed());
+        return list.size() > limit ? new ArrayList<>(list.subList(0, limit)) : list;
+    }
+
 
     private static String trim(String s, int max) {
         if (s == null) return "-";

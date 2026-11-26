@@ -11,6 +11,7 @@ rem    unless the user passed them explicitly.
 rem
 rem Usage:
 rem   analyze.bat -i dump.hprof -o report\
+rem   analyze.bat -i dump.hprof -o report\ --app-prefix com.mycorp
 rem   analyze.bat -b -i dump.hprof -o report\
 rem   analyze.bat -i dump.hprof -o report\ --top 5 --min-retained-mb 50
 rem

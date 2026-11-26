@@ -11,6 +11,7 @@
 #
 # 用法:
 #   ./analyze.sh -i dump.hprof -o report/
+#   ./analyze.sh -i dump.hprof -o report/ --app-prefix com.mycorp
 #   ./analyze.sh -b -i dump.hprof -o report/        # 后台 + 日志
 #   ./analyze.sh -i dump.hprof -o report/ --top 5 --min-retained-mb 50
 #

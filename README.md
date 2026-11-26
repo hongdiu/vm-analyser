@@ -40,6 +40,52 @@ tail -f analyze.log
 
 逃生舱：`XMX_OVERRIDE=8g`、`JAVA_OPTS=...`、`JAR=...`、`JAVA=...`、`LOG=...` 环境变量。
 
+## 打包与分发（一键）
+
+Windows 下**直接双击 `打包.bat`** 即可（自动定位 JDK 17 → 跑测试 → shadowJar → 生成 dist 与 zip）。
+需要跳过测试或清理时，在命令行带参数运行：
+
+```bat
+打包.bat -SkipTests
+打包.bat -Clean
+```
+
+也可以手动调用脚本：
+
+```powershell
+# Windows：定位 JDK 17 → 跑测试 → shadowJar → 生成 dist 目录与 zip
+powershell -ExecutionPolicy Bypass -File .\package.ps1 -SkipTests
+```
+
+```bash
+# Linux / macOS / Git-Bash
+SKIP_TESTS=1 ./package.sh
+```
+
+产物：
+
+```text
+dist/
+├── jvm-heap-analyzer-1.0.0/        便携目录（jar + analyze.bat + analyze.sh + USAGE.txt）
+├── jvm-heap-analyzer-1.0.0.zip     Windows 分发（可直接发给业务/运维）
+└── jvm-heap-analyzer-1.0.0.tar.gz  Linux/macOS 分发（package.sh 生成）
+```
+
+解压后直接跑真实 dump，`--app-prefix` 用来把线程栈里的业务帧挑出来：
+
+```bat
+analyze.bat -i D:\dumps\oom.hprof -o report --app-prefix com.mycorp
+analyze.bat -b -i D:\dumps\oom.hprof -o report --app-prefix com.mycorp,cn.example.order
+```
+
+```bash
+chmod +x analyze.sh
+./analyze.sh -i /data/oom.hprof -o report --app-prefix com.mycorp
+```
+
+`package.ps1` / `package.sh` 自动定位 JDK 17（也可用 `-JdkHome` / `JDK_HOME` 指定）；
+fat-jar 自包含 MAT/Equinox/FreeMarker，目标机器只需 JDK 17+。
+
 **服务器部署**：把 `jvm-heap-analyzer-1.0.0.jar` 与对应的 `analyze.sh`（Linux/macOS）
 或 `analyze.bat`（Windows）**并排拷贝**即可，脚本会在同目录找到 jar；也可用 `JAR=/path/jar`
 显式指定。fat-jar 自包含全部依赖（MAT/Equinox/FreeMarker/模板），服务器只需 JDK 17+。
@@ -58,17 +104,20 @@ java -Xmx6g -jar build\libs\jvm-heap-analyzer-1.0.0.jar ^
 | `--top` | 每类检测结果最多展示条数 | 20 |
 | `--max-path` | 引用链最大展示深度 | 8 |
 | `--min-retained-mb` | 泄漏嫌疑最小 Retained Heap 阈值（MB） | 5 |
+| `--app-prefix` | 业务类包前缀（逗号分隔），从线程栈中挑出业务帧 | 空 |
+| `--baseline` | 更早一份 dump，输出类实例数/浅堆增长证据 | 空 |
+| `--verbose` | 输出 MAT 解析进度细节 | 关 |
 
 > 大转储（几 GB 级）支配树会自动降级为 MAT 内置 retained 索引（解析完成后即判断，不做进程内 DFS），分析器内存因此保持平稳。
-| `--verbose` | 输出 MAT 解析进度细节 | 关 |
 
 输出：
 
 ```text
 report/
-├── index.html      # 主报告（① 堆概览 ② Top 内存占用类 ③ 泄漏嫌疑+引用链+模式+建议
-│                   #   ④ 大对象 ⑤ 可疑集合 ⑥ ThreadLocal ⑦ ClassLoader 异常）
-├── summary.json    # 结构化摘要（CI 可二次消费）
+├── index.html      # 主报告（◎ 诊断结论：代码线索/证据/规模/验证/可展开原始堆栈
+│                   #   ① 堆概览 ② Top 内存占用类 ③ 泄漏嫌疑 ④ 大对象
+│                   #   ⑤ 可疑集合 ⑥ ThreadLocal ⑦ ClassLoader ⑧ 基线对比）
+├── summary.json    # 结构化摘要（含 codeLocations/accumulated/confidence，CI 可二次消费）
 └── assets/style.css
 ```
 

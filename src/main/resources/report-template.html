@@ -14,6 +14,40 @@
 <h1>JVM 堆转储分析报告</h1>
 <div class="sub">jvm-heap-analyzer v${ov.version} · 生成时间 ${ov.generatedAt}</div>
 
+<#-- ============ ◎ 诊断结论：固定格式 + 可展开原始堆栈 ============ -->
+<h2>◎ 诊断结论</h2>
+<#if conclusions?size == 0>
+  <div class="empty">没有超过阈值的可疑对象；如需更细线索请调低 --min-retained-mb，
+    或提供两次间隔 dump 做增长对比。</div>
+<#else>
+<#list conclusions as c>
+<div class="concl">
+  <h3><span class="rank">#${c.rank}</span><span class="conf ${c.confClass}">${c.confidence}</span>${c.headline}
+      <span class="tag p">${c.pattern}</span></h3>
+  <div class="kv"><span class="k">代码线索</span><div class="v">${c.codeLineHtml}</div></div>
+  <div class="kv"><span class="k">证据</span><div class="v">
+    <ul class="det"><#list c.evidence as e><li>${e}</li></#list></ul>
+    ${c.pathHtml}
+  </div></div>
+  <div class="kv"><span class="k">规模</span><div class="v">${c.scale}</div></div>
+  <div class="kv"><span class="k">验证</span><div class="v">
+    <ul class="rec"><#list c.verify as v><li>${v}</li></#list></ul>
+  </div></div>
+  <div class="kv"><span class="k">建议</span><div class="v">
+    <ul class="rec"><#list c.recs as r><li>${r}</li></#list></ul>
+  </div></div>
+  <#if c.hasStack>
+  <details class="stack">
+    <summary>原始堆栈（${c.frameCount} 帧<#if c.stackTitle?has_content> · ${c.stackTitle}</#if>）</summary>
+    <pre class="frames">${c.stackHtml}</pre>
+  </details>
+  <#else>
+  <div class="sub" style="margin-top:8px">无原始线程栈证据：该对象不是线程栈 / 局部变量的直接持有者。</div>
+  </#if>
+</div>
+</#list>
+</#if>
+
 <#-- ============ ① 堆概览 ============ -->
 <h2>① 堆概览</h2>
 <div class="cards">
@@ -29,7 +63,7 @@ Dump 时间：${ov.dumpTime}<br>
 运行参数：${ov.options}</p>
 
 <#-- ============ ② Top 内存占用类 ============ -->
-<h2>② Top 内存占用类（按 Retained Heap）</h2>
+<h2>② Top 内存占用类（按 Retained Heap）<#if ov.domMode?contains("降级")><small>　降级近似：按热点根的支配子树归账</small></#if></h2>
 <#if topClasses?size == 0>
   <div class="empty">未发现类级内存占用数据</div>
 <#else>
@@ -51,7 +85,8 @@ Dump 时间：${ov.dumpTime}<br>
 <#else>
   <#list suspects as s>
   <div class="card" style="margin-bottom:14px;flex:none">
-    <div><span class="tag">#${s.rank} · score ${s.score}</span>
+    <div><span class="tag">#${s.rank}</span>
+         <span class="conf ${s.confClass}">${s.confidence}</span>
          <span class="tag p">${s.pattern}</span>
          <b style="font-size:15px;color:var(--txt)">${s.display}</b></div>
     <div class="sub" style="margin-top:6px">类：<code>${s.clazz}</code>
@@ -72,7 +107,7 @@ Dump 时间：${ov.dumpTime}<br>
 <#else>
 <table>
 <tr><th>对象</th><th>类</th><th class="num">Shallow</th><th class="num">Retained</th>
-<th class="num">score</th><th>模式</th><th>备注</th></tr>
+<th class="num">排序分</th><th>模式</th><th>备注</th></tr>
 <#list rows as r>
 <tr>
   <td><code>${r.display}</code></td>
@@ -96,6 +131,29 @@ Dump 时间：${ov.dumpTime}<br>
 <@findingTable "⑤ 可疑集合（Retained 超阈值的 Map / List / Set）" collections "未发现异常增长的集合" />
 <@findingTable "⑥ ThreadLocal 持有分析" threadLocals "未发现线程大量持有 ThreadLocal 数据" />
 <@findingTable "⑦ ClassLoader 异常" classLoaders "未发现同型 ClassLoader 多实例异常" />
+
+<h2>⑧ 基线对比（增长证据）</h2>
+<#if growth?? && growth.present>
+  <div class="sub">基线：${growth.baselinePath} · Used Heap ${growth.baselineUsedHeap} ·
+    对象 ${growth.baselineObjects}（口径：实例数与浅堆增量，只列增长项）</div>
+  <#if growth.rows?size gt 0>
+  <table>
+    <tr><th>#</th><th>类名</th><th class="num">实例数（基线 → 当前）</th>
+      <th class="num">增长率</th><th class="num">浅堆（基线 → 当前）</th></tr>
+    <#list growth.rows as row>
+    <tr><td>${row.index}</td><td><code>${row.className}</code></td>
+      <td class="num">${row.countBefore} → ${row.countAfter}（+${row.countDelta}）</td>
+      <td class="num">${row.countPct}</td>
+      <td class="num">${row.shallowBefore} → ${row.shallowAfter}（+${row.shallowDelta}）</td></tr>
+    </#list>
+  </table>
+  <#else>
+  <div class="empty">与基线相比没有显著增长（实例数 +100 或浅堆 +2MB 以上才列出）。</div>
+  </#if>
+<#else>
+  <div class="empty">未提供 <code>--baseline</code>。单份 dump 只能证明“此刻占用”，
+    增长证据需要第二份更早的 dump：<code>--baseline older.hprof</code>。</div>
+</#if>
 
 <div class="foot">
   本报告由 jvm-heap-analyzer 离线生成（解析引擎 Eclipse MAT）。

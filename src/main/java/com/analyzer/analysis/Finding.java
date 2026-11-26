@@ -13,6 +13,10 @@ import java.util.Map;
  */
 public final class Finding {
 
+    public static final String CONFIDENCE_HIGH = "HIGH";
+    public static final String CONFIDENCE_MEDIUM = "MEDIUM";
+    public static final String CONFIDENCE_LOW = "LOW";
+
     /** 关联对象 id（-1 表示聚合型结论，如“同型 ClassLoader 共 N 个”）。 */
     public int objectId = -1;
     public String className;
@@ -39,6 +43,38 @@ public final class Finding {
 
     /** 产出该结论的检测器名字。 */
     public String detectorName;
+
+    // ---------- 证据字段（由 CodeLocationExtractor / 检测器填充） ----------
+
+    /** 代码位置线索（业务帧优先，其后是 Java Local 持有帧、静态字段）。 */
+    public final List<CodeLocation> codeLocations = new ArrayList<>();
+
+    /** 原始线程栈帧文本（去掉 "at " 前缀），报告里可点击展开。 */
+    public List<String> stackFrames = new ArrayList<>();
+    /** 栈里属于业务代码的帧下标（报告高亮用）。 */
+    public final List<Integer> appFrameIndexes = new ArrayList<>();
+    /** 报告中高亮的帧下标（-1 表示无）。 */
+    public int stackFrameIndex = -1;
+    /** 所属线程名 / 线程对象 id。 */
+    public String threadName;
+    public int threadId = -1;
+
+    /** 占整堆比例（%）。 */
+    public double percentOfHeap;
+    /** 证据置信度：HIGH / MEDIUM / LOW。 */
+    public String confidence = CONFIDENCE_LOW;
+    /** 向下展开的累积对象（按类聚合），回答“它持有什么、多少”。 */
+    public final List<Accumulated> accumulated = new ArrayList<>();
+
+    /** 首条业务代码线索（没有则返回 null）。 */
+    public CodeLocation primaryCodeLocation() {
+        for (CodeLocation loc : codeLocations) {
+            if (loc.appCode && loc.hasSourceLine()) {
+                return loc;
+            }
+        }
+        return codeLocations.isEmpty() ? null : codeLocations.get(0);
+    }
 
     public Finding() {
     }

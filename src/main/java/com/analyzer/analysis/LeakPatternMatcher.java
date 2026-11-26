@@ -28,6 +28,7 @@ public final class LeakPatternMatcher {
     public static final String CACHE_GROWTH = "CACHE_GROWTH";
     public static final String CLASSLOADER_LEAK = "CLASSLOADER_LEAK";
     public static final String LARGE_BYTE_ARRAY = "LARGE_BYTE_ARRAY";
+    public static final String RESULT_SET_ACCUMULATION = "RESULT_SET_ACCUMULATION";
 
     /** 模式代码 → 中文标签（报告展示用）。 */
     public static String labelOf(String pattern) {
@@ -38,6 +39,7 @@ public final class LeakPatternMatcher {
             case CACHE_GROWTH: return "缓存无淘汰策略";
             case CLASSLOADER_LEAK: return "类加载器泄漏";
             case LARGE_BYTE_ARRAY: return "大字节数组堆积";
+            case RESULT_SET_ACCUMULATION: return "查询结果集全量累积";
             default: return "未归类";
         }
     }
@@ -55,16 +57,25 @@ public final class LeakPatternMatcher {
                     || (path.nodes().get(0).gcRootType != null
                         && path.nodes().get(0).gcRootType.contains("Thread")));
         boolean threadLocalMap = path != null && path.passesThroughClass("ThreadLocalMap");
-        boolean classLoader = cls.contains("ClassLoader");
+        // 查询结果集：链上出现 Hibernate 持久化上下文 / JDBC 行缓存即判为“全量结果集”
+        boolean resultSet = path != null
+                && (path.passesThroughClass("StatefulPersistenceContext")
+                    || path.passesThroughClass("JdbcValuesResultSet")
+                    || path.passesThroughClass("ResultsetRows")
+                    || path.passesThroughClass("loadingEntityHolders"));
+        // 只把自定义/业务加载器当泄漏信号；JDK 自带加载器（App/Platform/Boot）永远不判泄漏
+        boolean classLoader = cls.contains("ClassLoader") && !isJdkClassLoader(cls);
         boolean collection = isCollectionLike(cls);
         boolean bigCollection = collection
                 && Fmt.asMb(finding.retainedBytes) > 10.0; // 大集合阈值 10MB
         boolean byteArray = cls.startsWith("byte[]");
 
-        // ---- 模式判定（优先级从特殊到一般）----
+        // ---- 模式判定（优先级从特殊到一般，且必须有链上证据）----
         String pattern;
         if (threadLocalMap || (cls.contains("ThreadLocal") && heldByThread)) {
             pattern = THREAD_LOCAL_NOT_CLEANED;
+        } else if (resultSet) {
+            pattern = RESULT_SET_ACCUMULATION;
         } else if (classLoader) {
             pattern = CLASSLOADER_LEAK;
         } else if (byteArray && finding.shallowBytes > Fmt.MB) {
@@ -75,30 +86,32 @@ public final class LeakPatternMatcher {
             pattern = CACHE_GROWTH;
         } else if (staticEdge && looksLikeListener(cls)) {
             pattern = LISTENER_NOT_REMOVED;
-        } else if (collection && bigCollection) {
-            // 无静态边的大集合：增长但根因不明，按缓存无淘汰处理
-            pattern = CACHE_GROWTH;
-        } else if (collection && (staticEdge || heldByThread)) {
-            // 被静态/线程长期持有的容器：优先怀疑“只增不减”
-            pattern = staticEdge ? STATIC_COLLECTION : CACHE_GROWTH;
         } else if (staticEdge) {
             pattern = STATIC_COLLECTION;
         } else if (heldByThread && looksLikeListener(cls)) {
             pattern = LISTENER_NOT_REMOVED;
         } else {
+            // 无线索时不再硬套“缓存无淘汰”：宁可标未归类，也不给错建议
             pattern = NONE;
         }
 
         finding.pattern = pattern;
         finding.patternLabel = labelOf(pattern);
 
-        // ---- 评分公式 ----
+        // ---- 评分公式（MB 规模 + 证据加权，仅用于排序）----
         double score = Fmt.asMb(finding.retainedBytes);
         if (staticEdge) score += 20;
         if (heldByThread) score += 15;
         if (bigCollection) score += 25;
         if (classLoader) score += 10;
+        if (resultSet) score += 30;
         finding.score = score;
+    }
+
+    /** JDK 自带加载器不属于泄漏信号。 */
+    private static boolean isJdkClassLoader(String className) {
+        return className.startsWith("jdk.") || className.startsWith("java.")
+                || className.startsWith("sun.") || className.startsWith("com.sun.");
     }
 
     /** 是否“集合类嫌疑对象”。 */
